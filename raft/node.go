@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,9 @@ type Node struct {
 	lastIncludedTerm  int64
 	lastIncludedIndex int64
 	snapshotting      map[string]bool
+	nextIndex         map[string]int64
+	matchIndex        map[string]int64
+	commitCond        *sync.Cond
 }
 
 func NewNode(url string, db *engine.MemoryEngine) *Node {
@@ -54,8 +58,12 @@ func NewNode(url string, db *engine.MemoryEngine) *Node {
 		lastContacted:     time.Now(),
 		lastIncludedTerm:  -1,
 		lastIncludedIndex: -1,
+		commitIndex:       -1,
 		snapshotting:      make(map[string]bool),
+		nextIndex:         make(map[string]int64),
+		matchIndex:        make(map[string]int64),
 	}
+	node.commitCond = sync.NewCond(&node.mu)
 	node.loadState()
 	return node
 }
@@ -64,22 +72,19 @@ func (n *Node) Propose(command, key, value string) error {
 	n.mu.Lock()
 	var logEntry = proto.LogEntry{Term: n.currentTerm, Command: command, Key: key, Value: value}
 	n.log = append(n.log, &logEntry)
-	targetCommit := n.lastIncludedIndex + 1 + int64(len(n.log))
-	n.mu.Unlock()
+	targetCommit := n.lastIncludedIndex + int64(len(n.log))
+	n.persistState()
 
-	for {
-		n.mu.Lock()
-		if n.commitIndex >= targetCommit {
-			n.mu.Unlock()
-			return nil
-		}
-		if n.state != Leader {
-			n.mu.Unlock()
-			return fmt.Errorf("Lost leadership before commit")
-		}
-		n.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
+	for n.commitIndex < targetCommit && n.state == Leader {
+		n.commitCond.Wait()
 	}
+
+	if n.commitIndex >= targetCommit {
+		n.mu.Unlock()
+		return nil
+	}
+	n.mu.Unlock()
+	return fmt.Errorf("Lost leadership before commit")
 }
 
 func (n *Node) startHeartbeat() {
@@ -107,85 +112,43 @@ func (n *Node) startHeartbeat() {
 		voteChan := make(chan bool, peerCount)
 
 		for peer, db := range peersCopy {
-			go func(address string, c proto.DatabaseClient) {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*50)
-				defer cancel()
-
-				resp, err := c.AppendEntries(ctx, &proto.AppendEntriesRequest{
-					Term:         term,
-					LeaderId:     Leaderid,
-					Entries:      logs,
-					LeaderCommit: commitIndex,
-					PrevLogIndex: n.lastIncludedIndex,
-					PrevLogTerm:  n.lastIncludedTerm,
-				})
-
-				if err == nil {
-					if resp.NeedsSnapshot {
-						n.mu.Lock()
-						if !n.snapshotting[address] {
-							n.snapshotting[address] = true
-							go func(addr string, client proto.DatabaseClient) {
-								n.sendSnapshot(addr, client)
-								n.mu.Lock()
-								n.snapshotting[addr] = false
-								n.mu.Unlock()
-							}(address, c)
-						}
-						n.mu.Unlock()
-						voteChan <- false
-					} else if resp.Success {
-						voteChan <- true
-					} else {
-						voteChan <- false
-					}
-				} else {
-					voteChan <- false
-				}
-			}(peer, db)
+			go n.replicateToPeer(peer, db, term, Leaderid, commitIndex, voteChan)
 		}
 
 		for i := 0; i < peerCount; i++ {
 			if <-voteChan {
 				successes++
 			}
-			if successes > (peerCount+1)/2 {
-				break
-			}
 		}
 
 		n.mu.Lock()
-		if successes > (peerCount+1)/2 {
-			targetCommitIndex := n.lastIncludedIndex + 1 + int64(len(logs))
+		if n.state == Leader {
+			matchIndices := make([]int64, 0)
+			matchIndices = append(matchIndices, n.lastIncludedIndex+int64(len(n.log)))
+			for _, m := range n.matchIndex {
+				matchIndices = append(matchIndices, m)
+			}
+			
+			slices.SortFunc(matchIndices, func(a, b int64) int {
+				if a < b { return 1 }
+				if a > b { return -1 }
+				return 0
+			})
+			
+			majorityIdx := len(matchIndices) / 2
+			targetCommitIndex := matchIndices[majorityIdx]
 
 			if targetCommitIndex > n.commitIndex {
-				for i := n.commitIndex; i < targetCommitIndex; i++ {
-					arrayIndex := i - n.lastIncludedIndex - 1
+				logIdx := targetCommitIndex - n.lastIncludedIndex - 1
+				if logIdx >= 0 && logIdx < int64(len(n.log)) && n.log[logIdx].Term == n.currentTerm {
+					for i := n.commitIndex + 1; i <= targetCommitIndex; i++ {
+						arrayIndex := i - n.lastIncludedIndex - 1
 					if arrayIndex >= 0 && arrayIndex < int64(len(n.log)) {
-						entry := n.log[arrayIndex]
-						switch entry.Command {
-						case "PUT":
-							n.db.Put(entry.Key, entry.Value)
-						case "DELETE":
-							n.db.Delete(entry.Key)
-						case "JOIN":
-							port := entry.Key
-							address := "127.0.0.1:" + port
-							if address != n.id {
-								if _, exists := n.peers[port]; !exists {
-									go func(p, addr string) {
-										conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-										if err == nil {
-											n.AddPeer(p, proto.NewDatabaseClient(conn))
-											fmt.Printf("Node joined cluster: %s\n", p)
-										}
-									}(port, address)
-								}
-							}
-						}
+						n.applyEntry(n.log[arrayIndex])
 					}
 				}
 				n.commitIndex = targetCommitIndex
+				n.commitCond.Broadcast()
 				if n.commitIndex-n.lastIncludedIndex > 10 {
 					compactUpTo := n.commitIndex - 1
 					arrayIndex := compactUpTo - n.lastIncludedIndex - 1
@@ -197,15 +160,118 @@ func (n *Node) startHeartbeat() {
 
 					n.lastIncludedIndex = compactUpTo
 					n.lastIncludedTerm = newTerm
+					n.persistState()
 
 					fmt.Printf("Log Compacted! Index: %d\n", n.lastIncludedIndex)
 				}
-
 			}
 		}
-		n.mu.Unlock()
+	}
+	n.mu.Unlock()
 
-		time.Sleep(time.Millisecond * 50)
+	time.Sleep(time.Millisecond * 50)
+	}
+}
+
+func (n *Node) applyEntry(entry *proto.LogEntry) {
+	switch entry.Command {
+	case "PUT":
+		n.db.Put(entry.Key, entry.Value)
+	case "DELETE":
+		n.db.Delete(entry.Key)
+	case "JOIN":
+		port := entry.Key
+		address := "127.0.0.1:" + port
+		if address != n.id {
+			if _, exists := n.peers[port]; !exists {
+				go func(p, addr string) {
+					conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+					if err == nil {
+						n.AddPeer(p, proto.NewDatabaseClient(conn))
+						fmt.Printf("Node joined cluster: %s\n", p)
+					}
+				}(port, address)
+			}
+		}
+	}
+}
+
+func (n *Node) replicateToPeer(address string, c proto.DatabaseClient, term int64, leaderId string, commitIndex int64, voteChan chan bool) {
+	n.mu.Lock()
+	nextIdx := n.nextIndex[address]
+	
+	if nextIdx <= n.lastIncludedIndex {
+		if !n.snapshotting[address] {
+			n.snapshotting[address] = true
+			go func(addr string, client proto.DatabaseClient) {
+				n.sendSnapshot(addr, client)
+				n.mu.Lock()
+				n.snapshotting[addr] = false
+				n.nextIndex[addr] = n.lastIncludedIndex + 1
+				n.mu.Unlock()
+			}(address, c)
+		}
+		n.mu.Unlock()
+		voteChan <- false
+		return
+	}
+
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := n.lastIncludedTerm
+	
+	logIdx := prevLogIndex - n.lastIncludedIndex - 1
+	if logIdx >= 0 && logIdx < int64(len(n.log)) {
+		prevLogTerm = n.log[logIdx].Term
+	}
+
+	var sendLogs []*proto.LogEntry
+	startIdx := nextIdx - n.lastIncludedIndex - 1
+	if startIdx >= 0 && startIdx <= int64(len(n.log)) {
+		sendLogs = make([]*proto.LogEntry, len(n.log[startIdx:]))
+		copy(sendLogs, n.log[startIdx:])
+	}
+	n.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*50)
+	defer cancel()
+
+	resp, err := c.AppendEntries(ctx, &proto.AppendEntriesRequest{
+		Term:         term,
+		LeaderId:     leaderId,
+		Entries:      sendLogs,
+		LeaderCommit: commitIndex,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+	})
+
+	if err == nil {
+		n.mu.Lock()
+		if resp.Term > n.currentTerm {
+			n.currentTerm = resp.Term
+			n.state = Follower
+			n.votedFor = ""
+			n.persistState()
+			n.commitCond.Broadcast()
+			n.mu.Unlock()
+			voteChan <- false
+			return
+		}
+
+		if resp.Success {
+			n.lastContacted = time.Now()
+			n.matchIndex[address] = prevLogIndex + int64(len(sendLogs))
+			n.nextIndex[address] = n.matchIndex[address] + 1
+			n.mu.Unlock()
+			voteChan <- true
+		} else {
+			if n.nextIndex[address] > 0 {
+				n.nextIndex[address]--
+			}
+			n.mu.Unlock()
+			voteChan <- false
+		}
+	} else {
+		voteChan <- false
 	}
 }
 
@@ -237,7 +303,7 @@ func (n *Node) sendSnapshot(address string, c proto.DatabaseClient) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 	
-	_, err = c.InstallSnapshot(ctx, &proto.InstallSnapshotRequest{
+	resp, err := c.InstallSnapshot(ctx, &proto.InstallSnapshotRequest{
 		Term:              term,
 		LeaderId:          leaderId,
 		LastIncludedIndex: lastIndex,
@@ -248,9 +314,22 @@ func (n *Node) sendSnapshot(address string, c proto.DatabaseClient) {
 	
 	if err != nil {
 		fmt.Println("Failed to send snapshot:", err)
-	} else {
-		fmt.Printf("Snapshot successfully beamed to %s!\n", address)
+		return
 	}
+	
+	n.mu.Lock()
+	if resp.Term > n.currentTerm {
+		n.currentTerm = resp.Term
+		n.state = Follower
+		n.votedFor = ""
+		n.persistState()
+		n.commitCond.Broadcast()
+		n.mu.Unlock()
+		return
+	}
+	n.mu.Unlock()
+
+	fmt.Printf("Snapshot successfully beamed to %s!\n", address)
 }
 
 
@@ -267,6 +346,8 @@ func (n *Node) HandleInstallSnapshot(req *proto.InstallSnapshotRequest) *proto.I
 	n.votedFor = ""
 	n.lastContacted = time.Now()
 	n.currentLeader = req.LeaderId
+	n.persistState()
+	n.commitCond.Broadcast()
 
 	if req.LastIncludedIndex <= n.lastIncludedIndex {
 		return &proto.InstallSnapshotResponse{Term: n.currentTerm}
@@ -274,17 +355,19 @@ func (n *Node) HandleInstallSnapshot(req *proto.InstallSnapshotRequest) *proto.I
 
 	fmt.Printf("Received InstallSnapshot up to index %d!\n", req.LastIncludedIndex)
 
-	n.db.ClearState()
-
 	myPort := n.id[strings.LastIndex(n.id, ":")+1:] 
+
+	n.mu.Unlock()
+	n.db.ClearState()
 	path := "files/node_" + myPort + "/sst/data_compact.sst"
 	err := os.WriteFile(path, req.Data, 0644)
 	if err != nil {
 		fmt.Println("Error writing snapshot:", err)
+		n.mu.Lock()
 		return &proto.InstallSnapshotResponse{Term: n.currentTerm}
 	}
-
 	n.db.LoadSSTables()
+	n.mu.Lock()
 
 	for _, peerPort := range req.ActivePeers {
 		address := "127.0.0.1:" + peerPort
@@ -314,6 +397,13 @@ func (n *Node) HandleRequestVote(mess *proto.RequestVoteRequest) *proto.RequestV
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if time.Since(n.lastContacted) < (time.Millisecond * 150) {
+		return &proto.RequestVoteResponse{
+			Term:        n.currentTerm,
+			VoteGranted: false,
+		}
+	}
+
 	myLastLogIndex := n.lastIncludedIndex + int64(len(n.log))
 	myLastLogTerm := n.lastIncludedTerm
 	if len(n.log) > 0 {
@@ -332,6 +422,7 @@ func (n *Node) HandleRequestVote(mess *proto.RequestVoteRequest) *proto.RequestV
 		n.state = Follower
 		n.votedFor = ""
 		n.persistState()
+		n.commitCond.Broadcast()
 	}
 
 	if mess.Term < n.currentTerm || !upToDate {
@@ -345,6 +436,7 @@ func (n *Node) HandleRequestVote(mess *proto.RequestVoteRequest) *proto.RequestV
 		n.state = Follower
 		n.votedFor = mess.CandidateId
 		n.persistState()
+		n.commitCond.Broadcast()
 		return &proto.RequestVoteResponse{
 			Term:        n.currentTerm,
 			VoteGranted: true,
@@ -374,82 +466,118 @@ func (n *Node) HandleAppendEntries(req *proto.AppendEntriesRequest) *proto.Appen
 	defer n.mu.Unlock()
 
 	if req.Term < n.currentTerm {
-		return &proto.AppendEntriesResponse{
-			Success: false,
+		return &proto.AppendEntriesResponse{Success: false}
+	}
+
+	n.state = Follower
+	n.currentTerm = req.Term
+	n.lastContacted = time.Now()
+	n.currentLeader = req.LeaderId
+	n.persistState()
+	n.commitCond.Broadcast()
+
+	if req.PrevLogIndex >= n.lastIncludedIndex {
+		var prevLogTerm int64 = n.lastIncludedTerm
+		if req.PrevLogIndex > n.lastIncludedIndex {
+			logIdx := req.PrevLogIndex - n.lastIncludedIndex - 1
+			if logIdx < int64(len(n.log)) {
+				prevLogTerm = n.log[logIdx].Term
+			} else {
+				return &proto.AppendEntriesResponse{Success: false}
+			}
+		}
+		
+		if prevLogTerm != req.PrevLogTerm {
+			return &proto.AppendEntriesResponse{Success: false}
 		}
 	} else {
-		if req.PrevLogIndex >= 0 && n.commitIndex < req.PrevLogIndex {
-			n.lastContacted = time.Now()
-			n.currentTerm = req.Term
-			return &proto.AppendEntriesResponse{
-				Success:       false,
-				NeedsSnapshot: true,
-			}
-		}
+		return &proto.AppendEntriesResponse{Success: false}
+	}
 
-		n.state = Follower
-		n.currentTerm = req.Term
-		n.lastContacted = time.Now()
-		n.currentLeader = req.LeaderId
-		n.lastIncludedIndex = req.PrevLogIndex
-		n.lastIncludedTerm = req.PrevLogTerm
-		n.log = req.Entries
+	for i, newEntry := range req.Entries {
+		entryIndex := req.PrevLogIndex + 1 + int64(i)
+		logIdx := entryIndex - n.lastIncludedIndex - 1
 		
-		n.persistState()
-
-		if req.LeaderCommit > n.commitIndex {
-			for i := n.commitIndex; i < req.LeaderCommit; i++ {
-				arrayIndex := i - req.PrevLogIndex - 1
-				if arrayIndex >= 0 && arrayIndex < int64(len(req.Entries)) {
-					entry := req.Entries[arrayIndex]
-					switch entry.Command {
-					case "PUT":
-						n.db.Put(entry.Key, entry.Value)
-					case "DELETE":
-						n.db.Delete(entry.Key)
-					case "JOIN":
-						port := entry.Key
-						address := "127.0.0.1:" + port
-						if address != n.id {
-							if _, exists := n.peers[port]; !exists {
-								go func(p, addr string) {
-									conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-									if err == nil {
-										n.AddPeer(p, proto.NewDatabaseClient(conn))
-										fmt.Printf("Node joined cluster: %s\n", p)
-									}
-								}(port, address)
-							}
-						}
-					}
-				}
+		if logIdx < int64(len(n.log)) {
+			if n.log[logIdx].Term != newEntry.Term {
+				n.log = n.log[:logIdx]
+				n.log = append(n.log, newEntry)
 			}
-			n.commitIndex = req.LeaderCommit
-		}
-
-		return &proto.AppendEntriesResponse{
-			Success: true,
+		} else {
+			n.log = append(n.log, newEntry)
 		}
 	}
+
+	if req.LeaderCommit > n.commitIndex {
+		lastNewEntryIndex := req.PrevLogIndex + int64(len(req.Entries))
+		oldCommit := n.commitIndex
+
+		if req.LeaderCommit < lastNewEntryIndex {
+			n.commitIndex = req.LeaderCommit
+		} else {
+			n.commitIndex = lastNewEntryIndex
+		}
+
+		for i := oldCommit + 1; i <= n.commitIndex; i++ {
+			arrayIndex := i - n.lastIncludedIndex - 1
+			if arrayIndex >= 0 && arrayIndex < int64(len(n.log)) {
+				n.applyEntry(n.log[arrayIndex])
+			}
+		}
+		n.commitCond.Broadcast()
+
+		if n.commitIndex-n.lastIncludedIndex > 10 {
+			compactUpTo := n.commitIndex - 1
+			arrayIndex := compactUpTo - n.lastIncludedIndex - 1
+
+			if arrayIndex >= 0 && arrayIndex < int64(len(n.log)) {
+				newTerm := n.log[arrayIndex].Term
+				newLog := make([]*proto.LogEntry, len(n.log[arrayIndex+1:]))
+				copy(newLog, n.log[arrayIndex+1:])
+				n.log = newLog
+
+				n.lastIncludedIndex = compactUpTo
+				n.lastIncludedTerm = newTerm
+				n.persistState()
+
+				fmt.Printf("Follower Log Compacted! Index: %d\n", n.lastIncludedIndex)
+			}
+		}
+	}
+
+	return &proto.AppendEntriesResponse{Success: true}
 }
 
 func (n *Node) AddPeer(address string, client proto.DatabaseClient) {
 	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.peers[address] = client
+	if n.state == Leader {
+		n.nextIndex[address] = n.lastIncludedIndex + int64(len(n.log)) + 1
+		n.matchIndex[address] = 0
+	}
 	n.persistState()
-	n.mu.Unlock()
 }
 
 func (n *Node) RunElectionTimer() {
+	timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
+	timer := time.NewTimer(timeout)
 	for {
-		timer := rand.Intn(150) + 150
-		time.Sleep(time.Duration(timer) * time.Millisecond)
+		<-timer.C
 
 		n.mu.Lock()
-		if n.state == Follower || n.state == Candidate {
-			if time.Since(n.lastContacted) > (time.Duration(timer) * time.Millisecond) {
-				n.startNewElection()
+		elapsed := time.Since(n.lastContacted)
+		if (n.state == Follower || n.state == Candidate) && elapsed >= timeout {
+			n.startNewElection()
+			timeout = time.Duration(rand.Intn(150)+150) * time.Millisecond
+			timer.Reset(timeout)
+		} else {
+			remaining := timeout - elapsed
+			if remaining <= 0 {
+				timeout = time.Duration(rand.Intn(150)+150) * time.Millisecond
+				remaining = timeout
 			}
+			timer.Reset(remaining)
 		}
 		n.mu.Unlock()
 	}
@@ -474,9 +602,18 @@ func (n *Node) startNewElection() {
 
 	fmt.Printf("Node %s's timer expired! Starting election for Term %d...\n", candidateId, term)
 
-	if votes > (len(n.peers)+1)/2 {
+	if votes == ((len(n.peers)+1)/2)+1 {
 		n.state = Leader
 		n.currentLeader = n.id
+		
+		n.nextIndex = make(map[string]int64)
+		n.matchIndex = make(map[string]int64)
+		lastIdx := n.lastIncludedIndex + int64(len(n.log))
+		for p := range n.peers {
+			n.nextIndex[p] = lastIdx + 1
+			n.matchIndex[p] = 0
+		}
+		
 		fmt.Printf("\n Node %s WON the election! It is now the LEADER for Term %d! \n\n", n.id, n.currentTerm)
 		go n.startHeartbeat()
 		return
@@ -499,35 +636,53 @@ func (n *Node) startNewElection() {
 				return
 			}
 
+			n.mu.Lock()
+			if resp.Term > n.currentTerm {
+				n.currentTerm = resp.Term
+				n.state = Follower
+				n.votedFor = ""
+				n.persistState()
+				n.commitCond.Broadcast()
+				n.mu.Unlock()
+				return
+			}
+			
 			if resp.VoteGranted == true {
-				n.mu.Lock()
-				defer n.mu.Unlock()
-				if resp.Term > n.currentTerm {
-					n.currentTerm = resp.Term
-					n.state = Follower
-					n.votedFor = ""
-					n.persistState()
-					return
-				}
 				if n.state != Candidate {
+					n.mu.Unlock()
 					return
 				}
 				votes++
-				if votes > (len(n.peers)+1)/2 {
+				if votes == ((len(n.peers)+1)/2)+1 {
 					n.state = Leader
 					n.currentLeader = n.id
+					
+					n.nextIndex = make(map[string]int64)
+					n.matchIndex = make(map[string]int64)
+					lastIdx := n.lastIncludedIndex + int64(len(n.log))
+					for p := range n.peers {
+						n.nextIndex[p] = lastIdx + 1
+						n.matchIndex[p] = 0
+					}
+					
 					fmt.Printf("\n Node %s WON the election! It is now the LEADER for Term %d! \n\n", n.id, n.currentTerm)
 					go n.startHeartbeat()
+					n.mu.Unlock()
+					return
 				}
 			}
+			n.mu.Unlock()
 		}(peers, db)
 	}
 }
 
 type PersistentState struct {
-	CurrentTerm int64    `json:"current_term"`
-	VotedFor    string   `json:"voted_for"`
-	Peers       []string `json:"peers"`
+	CurrentTerm       int64               `json:"current_term"`
+	VotedFor          string              `json:"voted_for"`
+	Peers             []string            `json:"peers"`
+	Log               []*proto.LogEntry   `json:"log"`
+	LastIncludedIndex int64               `json:"last_included_index"`
+	LastIncludedTerm  int64               `json:"last_included_term"`
 }
 
 func (n *Node) persistState() {
@@ -541,9 +696,12 @@ func (n *Node) persistState() {
 	}
 
 	state := PersistentState{
-		CurrentTerm: n.currentTerm,
-		VotedFor:    n.votedFor,
-		Peers:       peerList,
+		CurrentTerm:       n.currentTerm,
+		VotedFor:          n.votedFor,
+		Peers:             peerList,
+		Log:               n.log,
+		LastIncludedIndex: n.lastIncludedIndex,
+		LastIncludedTerm:  n.lastIncludedTerm,
 	}
 
 	data, _ := json.Marshal(state)
@@ -559,10 +717,21 @@ func (n *Node) loadState() {
 		return
 	}
 
-	var state PersistentState
+	state := PersistentState{
+		LastIncludedIndex: -1,
+		LastIncludedTerm:  -1,
+	}
 	if err := json.Unmarshal(data, &state); err == nil {
 		n.currentTerm = state.CurrentTerm
 		n.votedFor = state.VotedFor
+		if state.Log != nil {
+			n.log = state.Log
+		}
+		n.lastIncludedIndex = state.LastIncludedIndex
+		n.lastIncludedTerm = state.LastIncludedTerm
+		if n.commitIndex < n.lastIncludedIndex {
+			n.commitIndex = n.lastIncludedIndex
+		}
 		
 		for _, p := range state.Peers {
 			addr := "127.0.0.1:" + p

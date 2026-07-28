@@ -25,6 +25,43 @@ GoDDB combines the core principles used in modern production databases (like Cas
 
 ---
 
+## 🏗️ Project Structure & Architecture Diagram
+
+To understand how the codebase is organized, here is the flow of data through the different packages:
+
+```mermaid
+graph TD
+    Client["Client (client/)"] -- gRPC --> Server["Server Layer (server/)"]
+    Server -- Proposes Data --> Raft["Raft Consensus (raft/)"]
+    
+    subgraph Raft Cluster
+        Raft -- "1. Replicates Log" --> OtherNodes["Other Raft Nodes"]
+        OtherNodes -- "2. Acknowledges" --> Raft
+    end
+    
+    Raft -- "3. Commits Data" --> Engine["LSM Storage Engine (engine/)"]
+    
+    subgraph LSM Storage Engine
+        Engine -- "A. Appends to" --> WAL["Write-Ahead Log (wal/)"]
+        Engine -- "B. Inserts into" --> MemTable["MemTable / AVL Tree (memtable/)"]
+        MemTable -- "C. Flushes to disk" --> SSTable["SSTables (sstable/)"]
+        SSTable -. "Optimizes reads via" .-> Bloom["Bloom Filters (bloom/)"]
+    end
+```
+
+### Folder Directory Breakdown
+- `client/` : The interactive CLI used to send `PUT`, `GET`, `DELETE`, and `JOIN` commands to the cluster.
+- `proto/` : Protocol Buffers defining the strict gRPC interfaces for client-server and node-to-node communication.
+- `server/` : The gRPC server that receives client requests and routes them to the Raft node.
+- `raft/` : The brain of the distributed system. Handles Leader Elections, Log Replication, Snapshots, and state persistence.
+- `engine/` : The core database manager that orchestrates all storage operations.
+- `wal/` : Write-Ahead Log for absolute data durability before memory flushes.
+- `memtable/` : A perfectly balanced in-memory AVL Tree for lightning-fast reads and writes.
+- `sstable/` : The immutable on-disk storage format (Sorted String Tables) where flushed data lives permanently.
+- `bloom/` : Probabilistic data structures loaded into RAM to instantly skip reading irrelevant SSTables.
+
+---
+
 ## 🗄️ Deep Dive: LSM-Tree Storage Engine
 
 The storage layer is engineered for extremely high write throughput. It bypasses the random I/O bottleneck of traditional B-Tree databases by ensuring that all disk writes are strictly sequential.
