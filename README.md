@@ -170,7 +170,7 @@ OK
 
 # Retrieve a value by key
 ddb> GET user:100
-"Dev Rao"
+"Test"
 
 # Delete a key (writes a tombstone)
 ddb> DELETE user:100
