@@ -2,11 +2,12 @@ package main
 
 import (
 	"DDB/engine"
-	"DDB/memtable"
+	"DDB/engine/memtable"
+	"DDB/engine/wal"
 	"DDB/proto"
 	"DDB/raft"
 	"DDB/server"
-	"DDB/wal"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -14,7 +15,6 @@ import (
 	"net"
 	"os"
 	"time"
-	"context"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

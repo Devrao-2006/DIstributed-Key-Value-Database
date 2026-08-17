@@ -1,10 +1,10 @@
 package engine
 
 import (
-	"DDB/bloom"
-	"DDB/memtable"
-	"DDB/sstable"
-	"DDB/wal"
+	"DDB/engine/bloom"
+	"DDB/engine/memtable"
+	"DDB/engine/sstable"
+	"DDB/engine/wal"
 	"errors"
 	"fmt"
 	"os"

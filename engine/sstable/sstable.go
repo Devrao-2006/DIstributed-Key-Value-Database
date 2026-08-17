@@ -1,9 +1,9 @@
 package sstable
 
 import (
-	"DDB/bloom"
-	"DDB/memtable"
-	"DDB/wal"
+	"DDB/engine/bloom"
+	"DDB/engine/memtable"
+	"DDB/engine/wal"
 	"encoding/binary"
 	"io"
 	"os"

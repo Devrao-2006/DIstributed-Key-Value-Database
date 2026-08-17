@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// Raft node role states.
 const (
 	Follower  state = 1
 	Candidate state = 2
@@ -26,6 +27,8 @@ const (
 
 type state uint8
 
+// Node represents a single consensus participant in the Raft cluster.
+// It manages term state, logs, peer connections, and synchronization primitives.
 type Node struct {
 	mu                sync.Mutex
 	state             state
@@ -50,6 +53,18 @@ type Node struct {
 	persistDirty      chan struct{}
 }
 
+// NewNode initializes and constructs a new Raft consensus Node instance.
+//
+// Purpose:
+//   Bootstraps a fresh or recovering node, binds its storage engine, restores any
+//   persisted consensus metadata from disk, and spawns the core background workers.
+//
+// How it does it:
+//   1. Allocates the Node struct with default follower state and initialized maps.
+//   2. Instantiates condition variables (commitCond, replicateCond) tied to the node mutex.
+//   3. Restores saved cluster state (term, votedFor, peers, logs) via loadState().
+//   4. Spawns the background apply loop (runApplier) for asynchronous disk writes.
+//   5. Spawns the background state persistence worker (runStatePersister).
 func NewNode(url string, db *engine.MemoryEngine) *Node {
 	peersmap := make(map[string]proto.DatabaseClient)
 	node := &Node{
@@ -78,6 +93,20 @@ func NewNode(url string, db *engine.MemoryEngine) *Node {
 	return node
 }
 
+// Propose appends a client command to the Raft log and blocks until it is safely committed.
+//
+// Purpose:
+//   Acts as the entry point for client write operations (PUT, DELETE, JOIN).
+//   Ensures an entry is replicated to a quorum before returning success to the caller.
+//
+// How it does it:
+//   1. Acquires n.mu and verifies the current node is the Leader.
+//   2. Appends a new proto.LogEntry with the current term and command payload to n.log.
+//   3. Computes targetCommit = lastIncludedIndex + len(log).
+//   4. Requests asynchronous disk persistence via signalPersist().
+//   5. If a single-node cluster, directly advances commit index; otherwise, broadcasts
+//      on replicateCond to immediately wake all per-peer replicator goroutines.
+//   6. Waits on commitCond until commitIndex >= targetCommit or leadership is lost.
 func (n *Node) Propose(command, key, value string) error {
 	n.mu.Lock()
 	if n.state != Leader {
@@ -110,6 +139,16 @@ func (n *Node) Propose(command, key, value string) error {
 	return fmt.Errorf("Lost leadership before commit")
 }
 
+// startLeaderLocked transitions the node into the active Leader role.
+// Must be called with n.mu held.
+//
+// Purpose:
+//   Spawns the background goroutines responsible for maintaining leadership and replicating logs.
+//
+// How it does it:
+//   1. Captures the current term while holding the mutex.
+//   2. Spawns runHeartbeatTimer to emit periodic heartbeat wakeups every 50ms.
+//   3. Spawns an independent peerReplicator goroutine for every connected peer.
 func (n *Node) startLeaderLocked() {
 	if n.state != Leader {
 		return
@@ -125,6 +164,16 @@ func (n *Node) startLeaderLocked() {
 	}
 }
 
+// runHeartbeatTimer runs a strict 50ms ticker to trigger periodic empty heartbeats.
+//
+// Purpose:
+//   Maintains leader authority across followers to prevent election timeouts.
+//
+// How it does it:
+//   1. Runs a time.Ticker every 50 milliseconds.
+//   2. On each tick, acquires n.mu and checks if leadership and term remain active.
+//   3. Calls replicateCond.Broadcast() to wake all peerReplicator goroutines.
+//   4. Exits automatically when the node is no longer the leader for this term.
 func (n *Node) runHeartbeatTimer(term int64) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -140,6 +189,23 @@ func (n *Node) runHeartbeatTimer(term int64) {
 	}
 }
 
+// peerReplicator manages the dedicated log replication pipeline for a single peer.
+//
+// Purpose:
+//   Independently streams new log entries or sends snapshots to a specific peer follower
+//   without blocking other peers or stalling when this peer experiences high latency.
+//
+// How it does it:
+//   1. Loops continuously while the node remains Leader for the term.
+//   2. Checks if the follower's nextIndex falls behind the compacted log boundary; if so,
+//      initiates an asynchronous SSTable snapshot transmission (sendSnapshot).
+//   3. Prepares the entries slice and calculates prevLogIndex/prevLogTerm.
+//   4. Releases n.mu and issues a gRPC AppendEntries RPC with a 50ms context timeout.
+//   5. Re-acquires n.mu:
+//      - If a higher term is discovered in the response, reverts to Follower.
+//      - On success, advances matchIndex and nextIndex, and calls checkAndAdvanceCommitIndex().
+//      - On failure/log mismatch, decrements nextIndex to locate the common ancestor log.
+//   6. If more unsent logs remain, loops immediately; otherwise, calls replicateCond.Wait().
 func (n *Node) peerReplicator(peerPort string, client proto.DatabaseClient, term int64) {
 	for {
 		n.mu.Lock()
@@ -240,6 +306,20 @@ func (n *Node) peerReplicator(peerPort string, client proto.DatabaseClient, term
 	}
 }
 
+// checkAndAdvanceCommitIndex calculates the median matchIndex across all peers to advance commitIndex.
+// Must be called with n.mu held.
+//
+// Purpose:
+//   Determines whether a log entry has been acknowledged by a majority of nodes and can be committed.
+//
+// How it does it:
+//   1. Collects all peer match indices plus the leader's own highest log index into a slice.
+//   2. Sorts indices in descending order and selects the majority median: matchIndices[len/2].
+//   3. If the target median exceeds the current commitIndex and was created in the current term:
+//      - Advances commitIndex to the target.
+//      - Broadcasts on commitCond to unblock waiting Propose() calls.
+//      - Collects newly committed proto.LogEntry items and non-blockingly queues them to applyChannel.
+//      - Triggers log compaction if the uncompacted log size exceeds the threshold (10 entries).
 func (n *Node) checkAndAdvanceCommitIndex() {
 	if n.state != Leader {
 		return
@@ -296,6 +376,17 @@ func (n *Node) checkAndAdvanceCommitIndex() {
 	}
 }
 
+// compactLog trims in-memory log entries up to a given index that have already been persisted.
+// Must be called with n.mu held.
+//
+// Purpose:
+//   Prevents unbounded in-memory log growth by slicing away old committed log entries.
+//
+// How it does it:
+//   1. Computes the offset of compactUpTo relative to lastIncludedIndex.
+//   2. Updates lastIncludedTerm to the term of the newly compacted boundary entry.
+//   3. Slices n.log to discard all entries up to compactUpTo.
+//   4. Updates lastIncludedIndex and notifies the state persister via signalPersist().
 func (n *Node) compactLog(compactUpTo int64) {
 	arrayIndex := compactUpTo - n.lastIncludedIndex - 1
 	if arrayIndex >= 0 && arrayIndex < int64(len(n.log)) {
@@ -312,6 +403,14 @@ func (n *Node) compactLog(compactUpTo int64) {
 	}
 }
 
+// runApplier is a long-running background worker that executes committed entries against the storage engine.
+//
+// Purpose:
+//   Executes disk operations (WAL writes and MemTable mutations) outside of the main consensus lock.
+//
+// How it does it:
+//   1. Continuously reads batches of committed LogEntry items from n.applyChannel.
+//   2. Iterates over each entry and invokes applyEntry(entry) sequentially without holding n.mu.
 func (n *Node) runApplier() {
 	for entries := range n.applyChannel {
 		for _, entry := range entries {
@@ -320,6 +419,15 @@ func (n *Node) runApplier() {
 	}
 }
 
+// applyEntry executes a single committed command on the local LSM-Tree database or cluster topology.
+//
+// Purpose:
+//   Applies the state machine transition specified by the log entry.
+//
+// How it does it:
+//   - "PUT": Calls n.db.Put(key, value) to update WAL and MemTable.
+//   - "DELETE": Calls n.db.Delete(key) to write a tombstone.
+//   - "JOIN": Asynchronously connects to the newly added peer port over gRPC and adds it to n.peers.
 func (n *Node) applyEntry(entry *proto.LogEntry) {
 	switch entry.Command {
 	case "PUT":
@@ -347,6 +455,16 @@ func (n *Node) applyEntry(entry *proto.LogEntry) {
 	}
 }
 
+// sendSnapshot transmits the current compacted SSTable snapshot file to a lagging follower.
+//
+// Purpose:
+//   Synchronizes a follower whose nextIndex is older than the leader's available log memory.
+//
+// How it does it:
+//   1. Triggers LSM compaction on the local engine to produce data_compact.sst.
+//   2. Reads the compacted snapshot data and gathers active cluster peers while holding n.mu.
+//   3. Calls c.InstallSnapshot over gRPC with a 5-second context timeout.
+//   4. Re-acquires n.mu: if follower responded with a higher term, steps down to Follower.
 func (n *Node) sendSnapshot(address string, c proto.DatabaseClient) {
 	fmt.Printf("Follower %s fell behind. Generating Snapshot...\n", address)
 
@@ -404,6 +522,17 @@ func (n *Node) sendSnapshot(address string, c proto.DatabaseClient) {
 	fmt.Printf("Snapshot successfully beamed to %s!\n", address)
 }
 
+// HandleInstallSnapshot handles incoming InstallSnapshot RPC requests from the leader.
+//
+// Purpose:
+//   Replaces the follower's entire storage engine and log state with the snapshot provided by the leader.
+//
+// How it does it:
+//   1. Acquires n.mu and rejects requests with a term lower than n.currentTerm.
+//   2. Adopts the leader's term, resets votedFor, and sets state to Follower.
+//   3. Writes the snapshot binary to data_compact.sst and reloads SSTables into the LSM engine.
+//   4. Establishes gRPC connections to any newly specified cluster peers.
+//   5. Truncates all existing in-memory logs, updates lastIncludedIndex and commitIndex, and persists state.
 func (n *Node) HandleInstallSnapshot(req *proto.InstallSnapshotRequest) *proto.InstallSnapshotResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -466,6 +595,18 @@ func (n *Node) HandleInstallSnapshot(req *proto.InstallSnapshotRequest) *proto.I
 	return &proto.InstallSnapshotResponse{Term: n.currentTerm}
 }
 
+// HandleRequestVote processes vote requests from election candidates.
+//
+// Purpose:
+//   Enforces Raft leader election safety rules, including log up-to-dateness and single-vote-per-term limits.
+//
+// How it does it:
+//   1. Acquires n.mu and ignores requests if a valid heartbeat was received recently (< 150ms).
+//   2. Computes the local lastLogTerm and lastLogIndex.
+//   3. Evaluates if the candidate's log is at least as up-to-date as the local log:
+//      - Candidate's last log term is greater, OR terms are equal and candidate's index >= local index.
+//   4. If candidate's term is greater than currentTerm, transitions to Follower and clears votedFor.
+//   5. Grants vote if term matches, log is up-to-date, and votedFor is empty or matches candidateId.
 func (n *Node) HandleRequestVote(mess *proto.RequestVoteRequest) *proto.RequestVoteResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -523,6 +664,13 @@ func (n *Node) HandleRequestVote(mess *proto.RequestVoteRequest) *proto.RequestV
 	}
 }
 
+// IsLeader checks if the current node considers itself the cluster leader.
+//
+// Purpose:
+//   Used by API handlers to guard write requests against non-leader execution.
+//
+// How it does it:
+//   Compares GetLeader() against the node's own URL identifier.
 func (n *Node) IsLeader() bool {
 	if n.GetLeader() == n.id {
 		return true
@@ -530,12 +678,32 @@ func (n *Node) IsLeader() bool {
 	return false
 }
 
+// GetLeader returns the URL address of the known active leader.
+//
+// Purpose:
+//   Provides redirection information to clients querying a follower node.
+//
+// How it does it:
+//   Acquires n.mu and returns the currentLeader string safely.
 func (n *Node) GetLeader() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.currentLeader
 }
 
+// HandleAppendEntries processes incoming AppendEntries RPCs for both heartbeats and log replication.
+//
+// Purpose:
+//   Synchronizes the follower's log with the leader, maintains leader contact, and applies committed entries.
+//
+// How it does it:
+//   1. Acquires n.mu and rejects requests with a term lower than n.currentTerm.
+//   2. Updates lastContacted timestamp, sets currentLeader, and transitions to Follower state.
+//   3. Validates that the follower contains an entry matching PrevLogIndex and PrevLogTerm.
+//   4. Appends any new entries, resolving and truncating any conflicting uncommitted entries.
+//   5. If LeaderCommit > commitIndex, updates commitIndex and non-blockingly queues newly committed
+//      entries to applyChannel for the background applier.
+//   6. Triggers log compaction if needed and returns success: true.
 func (n *Node) HandleAppendEntries(req *proto.AppendEntriesRequest) *proto.AppendEntriesResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -620,6 +788,16 @@ func (n *Node) HandleAppendEntries(req *proto.AppendEntriesRequest) *proto.Appen
 	return &proto.AppendEntriesResponse{Success: true, Term: n.currentTerm}
 }
 
+// AddPeer dynamically adds a new peer node's gRPC client connection to the active cluster.
+//
+// Purpose:
+//   Allows runtime cluster membership changes without needing a full cluster restart.
+//
+// How it does it:
+//   1. Acquires n.mu and inserts the client into the n.peers map.
+//   2. If the current node is Leader, initializes nextIndex and matchIndex for the new peer
+//      and immediately spawns a dedicated peerReplicator goroutine.
+//   3. Dispatches a signal to persist the updated peer list to state.json.
 func (n *Node) AddPeer(address string, client proto.DatabaseClient) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -632,6 +810,16 @@ func (n *Node) AddPeer(address string, client proto.DatabaseClient) {
 	n.signalPersist()
 }
 
+// RunElectionTimer monitors leader heartbeat health and triggers elections on timeout.
+//
+// Purpose:
+//   Detects leader failure and transitions the node to Candidate to elect a new leader.
+//
+// How it does it:
+//   1. Generates a randomized timeout between 150ms and 300ms to prevent split votes.
+//   2. Periodically checks time.Since(lastContacted).
+//   3. If elapsed time exceeds timeout while in Follower/Candidate state, calls startNewElection().
+//   4. Resets the timer with a new randomized duration and repeats.
 func (n *Node) RunElectionTimer() {
 	timeout := time.Duration(rand.Intn(150)+150) * time.Millisecond
 	timer := time.NewTimer(timeout)
@@ -656,6 +844,18 @@ func (n *Node) RunElectionTimer() {
 	}
 }
 
+// startNewElection promotes the node to Candidate and solicits votes from all cluster peers.
+//
+// Purpose:
+//   Executes the election phase of the Raft consensus algorithm.
+//
+// How it does it:
+//   1. Transitions state to Candidate, increments currentTerm, and votes for self (votedFor = id).
+//   2. Gathers lastLogIndex and lastLogTerm for the RequestVote payload.
+//   3. If self-vote satisfies quorum (e.g. single-node cluster), becomes Leader immediately via startLeaderLocked().
+//   4. Otherwise, concurrently sends RequestVote RPCs to all peers with a 50ms timeout.
+//   5. Tallies granted votes under n.mu; upon securing majority ((N/2)+1), promotes to Leader,
+//      initializes peer replication indices, and invokes startLeaderLocked().
 func (n *Node) startNewElection() {
 	n.state = Candidate
 	n.votedFor = n.id
@@ -750,6 +950,7 @@ func (n *Node) startNewElection() {
 	}
 }
 
+// PersistentState represents the JSON schema saved to state.json for crash recovery.
 type PersistentState struct {
 	CurrentTerm       int64             `json:"current_term"`
 	VotedFor          string            `json:"voted_for"`
@@ -759,6 +960,13 @@ type PersistentState struct {
 	LastIncludedTerm  int64             `json:"last_included_term"`
 }
 
+// signalPersist notifies the background persistence worker that new state needs to be flushed to disk.
+//
+// Purpose:
+//   Provides a non-blocking trigger to coalesce multiple rapid state mutations into a single disk write.
+//
+// How it does it:
+//   Performs a non-blocking select push to the 1-capacity persistDirty channel.
 func (n *Node) signalPersist() {
 	select {
 	case n.persistDirty <- struct{}{}:
@@ -766,6 +974,15 @@ func (n *Node) signalPersist() {
 	}
 }
 
+// runStatePersister is a dedicated background worker that writes consensus metadata to disk.
+//
+// Purpose:
+//   Performs batched JSON encoding and disk I/O without blocking the critical consensus path.
+//
+// How it does it:
+//   1. Waits on n.persistDirty channel for incoming persistence requests.
+//   2. Sleeps 5ms to batch and coalesce multiple rapid signals into a single write.
+//   3. Calls persistStateSync() to serialize and write state.json.
 func (n *Node) runStatePersister() {
 	for range n.persistDirty {
 		time.Sleep(5 * time.Millisecond)
@@ -773,6 +990,15 @@ func (n *Node) runStatePersister() {
 	}
 }
 
+// persistStateSync captures a snapshot of the consensus state and saves it to state.json.
+//
+// Purpose:
+//   Guarantees durability of CurrentTerm, VotedFor, and uncompacted LogEntries.
+//
+// How it does it:
+//   1. Acquires n.mu, copies currentTerm, votedFor, peer list, log, and snapshot metadata into PersistentState.
+//   2. Releases n.mu before performing file system operations.
+//   3. Marshals state into JSON and writes it atomically to files/node_<port>/raft/state.json.
 func (n *Node) persistStateSync() {
 	n.mu.Lock()
 	myPort := n.id[strings.LastIndex(n.id, ":")+1:]
@@ -800,6 +1026,16 @@ func (n *Node) persistStateSync() {
 	}
 }
 
+// loadState restores persisted Raft metadata and peers from state.json upon node boot.
+//
+// Purpose:
+//   Prevents amnesia loops upon crash recovery so rebooted nodes remember terms, votes, and peers.
+//
+// How it does it:
+//   1. Reads files/node_<port>/raft/state.json from disk.
+//   2. Unmarshals JSON into PersistentState.
+//   3. Restores currentTerm, votedFor, log entries, and snapshot indices.
+//   4. Dials gRPC connections to all saved peers to restore the active cluster topology.
 func (n *Node) loadState() {
 	myPort := n.id[strings.LastIndex(n.id, ":")+1:]
 	path := "files/node_" + myPort + "/raft/state.json"

@@ -1,185 +1,200 @@
 # GoDDB: Distributed Key-Value Database
 
-GoDDB is a highly available, fault-tolerant distributed key-value database built entirely from scratch in Go. It implements the **Raft Consensus Algorithm** for distributed state management and an **LSM-Tree** (Log-Structured Merge-Tree) storage engine for extremely fast, persistent data storage.
+GoDDB is a highly available, fault-tolerant distributed key-value database built from scratch in Go. It combines the **Raft Consensus Algorithm** for distributed consensus with an **LSM-Tree** (Log-Structured Merge-Tree) storage engine for persistent, high-throughput storage.
 
 ![Go](https://img.shields.io/badge/go-%2300ADD8.svg?style=for-the-badge&logo=go&logoColor=white)
 ![gRPC](https://img.shields.io/badge/gRPC-244C5A.svg?style=for-the-badge&logo=grpc&logoColor=white)
 ![Protobuf](https://img.shields.io/badge/Protocol%20Buffers-4285F4.svg?style=for-the-badge&logo=google&logoColor=white)
 
+---
+
 ## 📖 Table of Contents
 - [Architecture Overview](#-architecture-overview)
-- [Deep Dive: LSM-Tree Storage Engine](#-deep-dive-lsm-tree-storage-engine)
+- [Project Structure](#-project-structure)
 - [Deep Dive: Raft Consensus Layer](#-deep-dive-raft-consensus-layer)
+- [Deep Dive: LSM-Tree Storage Engine](#-deep-dive-lsm-tree-storage-engine)
 - [Getting Started](#%EF%B8%8F-getting-started)
-- [Fault Tolerance & Testing](#-fault-tolerance--testing)
+- [Fault Tolerance & Resilience Testing](#-fault-tolerance--resilience-testing)
 
 ---
 
 ## 🚀 Architecture Overview
 
-GoDDB combines the core principles used in modern production databases (like Cassandra, RocksDB, and etcd):
+GoDDB implements modern database and distributed systems patterns:
 
-1. **Raft Consensus Layer:** Guarantees strong consistency and high availability across the cluster. If the Leader crashes, the cluster seamlessly elects a new Leader in milliseconds. It perfectly handles split-brains, network partitions, and node failures.
-2. **LSM-Tree Storage Engine:** Instead of updating data in place, all writes are appended to an in-memory AVL Tree (MemTable) and periodically flushed to immutable Sorted String Tables (SSTables) on the hard drive.
-3. **gRPC Network Layer:** All inter-node communication (Heartbeats, Leader Elections, and Snapshots) and client-server communication runs on high-performance gRPC.
+1. **Raft Consensus Layer (`raft/`)**: Ensures strong consistency and high availability across cluster nodes. If the Leader fails, remaining nodes elect a new Leader in milliseconds without data loss or split-brains.
+2. **LSM-Tree Storage Engine (`engine/`)**: Optimizes write throughput by appending mutations to an in-memory AVL Tree (MemTable) backed by a Write-Ahead Log (WAL), flushing sequentially to immutable Sorted String Tables (SSTables) on disk.
+3. **gRPC Network Layer (`server/`, `proto/`)**: Handles all inter-node consensus RPCs (`RequestVote`, `AppendEntries`, `InstallSnapshot`, `JoinCluster`) and client requests over low-latency gRPC.
 
 ---
 
-## 🏗️ Project Structure & Architecture Diagram
-
-To understand how the codebase is organized, here is the flow of data through the different packages:
+## 🏗️ Project Structure
 
 ```mermaid
 graph TD
-    Client["Client (client/)"] -- gRPC --> Server["Server Layer (server/)"]
-    Server -- Proposes Data --> Raft["Raft Consensus (raft/)"]
+    Client["Client CLI (client/)"] -- gRPC --> Server["Server Transport (server/)"]
+    Server -- Proposes Write --> Raft["Raft Consensus (raft/)"]
     
-    subgraph Raft Cluster
-        Raft -- "1. Replicates Log" --> OtherNodes["Other Raft Nodes"]
-        OtherNodes -- "2. Acknowledges" --> Raft
+    subgraph Raft Consensus Cluster
+        Raft -- "1. Parallel Log Replication" --> OtherNodes["Follower Nodes"]
+        OtherNodes -- "2. Quorum ACK" --> Raft
     end
     
-    Raft -- "3. Commits Data" --> Engine["LSM Storage Engine (engine/)"]
+    Raft -- "3. Async Commit" --> Engine["LSM Storage Engine (engine/)"]
     
-    subgraph LSM Storage Engine
-        Engine -- "A. Appends to" --> WAL["Write-Ahead Log (wal/)"]
-        Engine -- "B. Inserts into" --> MemTable["MemTable / AVL Tree (memtable/)"]
-        MemTable -- "C. Flushes to disk" --> SSTable["SSTables (sstable/)"]
-        SSTable -. "Optimizes reads via" .-> Bloom["Bloom Filters (bloom/)"]
+    subgraph LSM Storage Engine (engine/)
+        Engine -- "A. Appends to" --> WAL["Write-Ahead Log (engine/wal/)"]
+        Engine -- "B. Inserts into" --> MemTable["MemTable / AVL Tree (engine/memtable/)"]
+        MemTable -- "C. Flushes to disk" --> SSTable["SSTables (engine/sstable/)"]
+        SSTable -. "Accelerates reads via" .-> Bloom["Bloom Filters (engine/bloom/)"]
     end
 ```
 
-### Folder Directory Breakdown
-- `client/` : The interactive CLI used to send `PUT`, `GET`, `DELETE`, and `JOIN` commands to the cluster.
-- `proto/` : Protocol Buffers defining the strict gRPC interfaces for client-server and node-to-node communication.
-- `server/` : The gRPC server that receives client requests and routes them to the Raft node.
-- `raft/` : The brain of the distributed system. Handles Leader Elections, Log Replication, Snapshots, and state persistence.
-- `engine/` : The core database manager that orchestrates all storage operations.
-- `wal/` : Write-Ahead Log for absolute data durability before memory flushes.
-- `memtable/` : A perfectly balanced in-memory AVL Tree for lightning-fast reads and writes.
-- `sstable/` : The immutable on-disk storage format (Sorted String Tables) where flushed data lives permanently.
-- `bloom/` : Probabilistic data structures loaded into RAM to instantly skip reading irrelevant SSTables.
+### Directory Breakdown
 
----
-
-## 🗄️ Deep Dive: LSM-Tree Storage Engine
-
-The storage layer is engineered for extremely high write throughput. It bypasses the random I/O bottleneck of traditional B-Tree databases by ensuring that all disk writes are strictly sequential.
-
-### 1. MemTable (AVL Tree)
-When a `PUT` or `DELETE` request arrives, the data is immediately inserted into an in-memory balanced AVL tree. This ensures `O(log n)` time complexity for all read and write operations. Because data is structured in memory, it can be instantly retrieved without touching the disk.
-
-### 2. Write-Ahead Log (WAL)
-To prevent data loss if the server crashes before the MemTable is saved, every operation is simultaneously appended to a sequential disk file called the Write-Ahead Log. Upon reboot, the database replays the WAL to perfectly reconstruct the MemTable.
-
-### 3. Sorted String Tables (SSTables)
-Once the MemTable reaches a predefined capacity, the database locks the table, flushes the sequential keys to an immutable `data.sst` file on the disk, and clears the memory. 
-
-### 4. Bloom Filters
-Searching through dozens of SSTable files on disk for a single key is incredibly slow. To solve this, every SSTable generates a **Bloom Filter** (a probabilistic data structure). The Bloom Filters are kept in RAM. Before checking an SSTable, the database queries the Bloom Filter. If it returns `false`, the database knows with 100% certainty that the key does not exist in that file, instantly skipping the disk read!
-
-### 5. Compaction
-Over time, keys may be updated or deleted, leaving stale data in older SSTables. A background process periodically reads multiple SSTables, merges them together, purges deleted/stale keys, and writes a newly compacted SSTable.
+```
+├── engine/                 # LSM-Tree Storage Engine Domain
+│   ├── engine.go           # Engine interface definition
+│   ├── memory.go           # Storage engine orchestrator & recovery manager
+│   ├── bloom/              # Probabilistic Bloom Filter for skipping disk reads
+│   │   └── bloom.go
+│   ├── memtable/           # In-memory balanced AVL Tree index
+│   │   └── avl.go
+│   ├── sstable/            # Immutable on-disk Sorted String Tables
+│   │   └── sstable.go
+│   └── wal/                # Write-Ahead Log durability layer
+│       ├── entry.go
+│       └── wal.go
+├── raft/                   # Distributed Consensus Layer
+│   └── node.go             # Raft state machine, replication, & persistence
+├── server/                 # Network Transport Layer
+│   └── server.go           # gRPC service implementation
+├── proto/                  # Protocol Buffers schema & generated stubs
+│   ├── db.proto
+│   ├── db.pb.go
+│   └── db_grpc.pb.go
+├── client/                 # Interactive CLI client
+│   └── main.go
+├── main.go                 # Server node entrypoint
+├── go.mod / go.sum
+└── README.md
+```
 
 ---
 
 ## ⚙️ Deep Dive: Raft Consensus Layer
 
-GoDDB implements a strict, ground-up version of the Raft consensus algorithm. It ensures that every node in the cluster holds the exact same data, and that the database remains highly available even if multiple servers catch on fire.
+The consensus engine in [`raft/node.go`](raft/node.go) is built for high throughput and non-blocking operation:
 
-### 1. Leader Election
-Nodes start as `Followers` with randomized countdown timers. If they don't receive a heartbeat from a Leader before their timer expires, they promote themselves to `Candidate`, increment their Term, and request votes from the cluster. The first node to receive a majority of votes becomes the `Leader`. Randomized timers mathematically prevent "split votes" from deadlocking the system.
+### 1. Dedicated Per-Peer Replication Pipelines
+Instead of a single blocking loop, the Leader runs an independent `peerReplicator` goroutine for each follower. Slower or temporarily partitioned nodes cannot stall consensus or increase write latency for healthy peers.
 
-### 2. Log Replication & Strict Safety
-The Leader accepts client requests, appends them to its Raft Log, and broadcasts them to the Followers via `AppendEntries` RPCs. It only commits the data to the LSM-Tree after a majority of Followers acknowledge the log. 
-**Safety First:** GoDDB implements the Raft `Up-To-Date` restriction. A Follower will absolutely refuse to vote for a Candidate if the Candidate's log is older than its own. This guarantees that a node missing data can *never* become the Leader.
+### 2. Instant Replication & Decoupled Heartbeats
+- **Instant Event-Driven Replication**: When `Propose()` appends a log entry, it broadcasts to `replicateCond`, waking all peer goroutines immediately.
+- **Strict Heartbeat Timer**: A background timer fires every 50ms to emit empty `AppendEntries` heartbeats, preventing election timeouts even during intensive write spikes.
 
-### 3. Auto-Snapshotting (Catch-up Mechanism)
-If a node goes offline and misses thousands of logs, the Leader's in-memory log will have already been compacted. Instead of failing, the Leader automatically reads its compacted `data_compact.sst` and streams a massive state snapshot over gRPC to the lagging Follower, instantly syncing it back into the cluster.
+### 3. Asynchronous Commit Applier
+Advancing `commitIndex` queues committed entries to a buffered channel (`applyChannel`). A dedicated background worker (`runApplier`) executes writes against the storage engine without holding the main consensus mutex during disk I/O.
 
-### 4. Dynamic Cluster Membership
-You do not need to restart the cluster to scale it! You can add new nodes dynamically by issuing a `JOIN` command. The Leader processes this configuration change as a standard log entry, and all nodes dynamically open background gRPC connections to the new server on the fly.
+### 4. Non-Blocking Batched State Persistence
+Consensus metadata changes signal a background worker (`runStatePersister`) via `persistDirty`. State changes (`state.json`) are batched and written to disk without blocking the critical RPC path.
 
-### 5. Consensus State Persistence
-A dedicated `state.json` file on the disk permanently stores the node's `CurrentTerm`, `VotedFor`, and active `Peers`. If a node crashes and reboots, it perfectly remembers the cluster topology. This completely prevents "Amnesia Loops" where a rebooted node mistakenly believes it is alone and triggers rogue elections.
+### 5. Snapshot Catch-up Mechanism
+When a follower falls behind compacted log entries, the Leader streams an SSTable snapshot (`data_compact.sst`) via `InstallSnapshot` to bring the follower up to date.
+
+### 6. Dynamic Membership (`JOIN`)
+Nodes can dynamically join a live cluster at runtime via the `JOIN` command. The Leader proposes the configuration change through the Raft log, and all nodes dial the new peer.
+
+---
+
+## 🗄️ Deep Dive: LSM-Tree Storage Engine
+
+The storage layer in [`engine/`](engine/) delivers high write throughput by ensuring all disk operations are sequential:
+
+### 1. MemTable (AVL Tree)
+All `PUT` and `DELETE` operations update an in-memory balanced AVL Tree, providing $O(\log n)$ reads and writes without disk head movement.
+
+### 2. Write-Ahead Log (WAL)
+Before updating memory, every operation is written to the WAL. If a node crashes, `Recovery()` replays the WAL to reconstruct the active MemTable. Once flushed to an SSTable, the WAL is truncated.
+
+### 3. Immutable SSTables & Compaction
+When the MemTable reaches 10 keys, it flushes sorted keys to an immutable `.sst` file. A background compaction process merges older SSTables, purges tombstones, and produces a consolidated `data_compact.sst`.
+
+### 4. Bloom Filters
+Each SSTable maintains an in-memory Bloom filter. If a key is not present in the filter, disk I/O for that SSTable is bypassed entirely.
 
 ---
 
 ## 🛠️ Getting Started
 
 ### Prerequisites
+- **Go 1.20+**
+- **Protocol Buffers Compiler (`protoc`)** (only if editing `.proto` files)
 
-- Go 1.20+
-- Protocol Buffers Compiler (`protoc`)
+### 1. Start a 3-Node Local Cluster
 
-### 1. Start the Cluster
+Open 3 separate terminals:
 
-You can run the database nodes locally on different ports. Each node will create its own isolated `files/node_{port}` directory for storage.
-
-Open Terminal 1 (Start the Seed Node):
-
+**Terminal 1 (Seed Node):**
 ```bash
 go run main.go 50051
 ```
 
-_Wait a few seconds for it to win the election and become the Leader._
-
-Open Terminal 2 (Start Node 2 and join the cluster):
-
+**Terminal 2 (Node 2 - Join Seed):**
 ```bash
 go run main.go 50052 50051
 ```
 
-Open Terminal 3 (Start Node 3 and join the cluster):
-
+**Terminal 3 (Node 3 - Join Seed):**
 ```bash
 go run main.go 50053 50051
 ```
 
-### 2. Connect the Client CLI
+---
 
-Open a new terminal and connect the CLI to the Leader node:
+### 2. Connect the Interactive CLI
+
+Open a new terminal to connect to the cluster:
 
 ```bash
 cd client
 go run main.go 50051
 ```
 
-### 3. Interact with the Database
-
-Inside the interactive CLI, you can run:
+### 3. Database Commands
 
 ```bash
-# Store data
-> PUT username xyz
+# Insert / update key-value pairs
+ddb> PUT user:100 "Test"
 OK
 
-# Retrieve data
-> GET username
-xyz
+# Retrieve a value by key
+ddb> GET user:100
+"Dev Rao"
 
-# Delete data
-> DELETE username
+# Delete a key (writes a tombstone)
+ddb> DELETE user:100
 OK
 
-# Dynamically add a new node to the live cluster
-> JOIN 50054
+# Dynamically add a new node (e.g. port 50054) to the live cluster
+ddb> JOIN 50054
 OK
+
+# Exit the CLI
+ddb> exit
 ```
 
 ---
 
-## 🛡️ Fault Tolerance & Testing
+## 🛡️ Fault Tolerance & Resilience Testing
 
-GoDDB is built to survive chaos. You can manually test its resilience by simulating catastrophic failures:
+### Test 1: Leader Failover
+1. Boot a 3-node cluster (`50051`, `50052`, `50053`).
+2. Kill the Leader terminal with `Ctrl+C`.
+3. Within milliseconds, the remaining followers detect the timeout, elect a new Leader, and resume serving client reads and writes.
 
-### Test 1: Leader Assassination
-1. Boot a 3-node cluster.
-2. Go to the terminal running the Leader (usually `50051`) and hit `Ctrl+C` to kill it.
-3. Watch the other terminals! Within milliseconds, their timers will expire, they will hold an election, and a new Leader will be crowned to keep the database online.
-
-### Test 2: Split Brain & Amnesia Recovery
-1. Boot a 3-node cluster.
-2. Kill a Follower node.
-3. Wait 10 seconds, then reboot the Follower node.
-4. Watch as the Follower instantly reads its `state.json`, perfectly remembers the cluster, seamlessly reconnects to the existing Leader, and requests an `InstallSnapshot` to download all the data it missed while it was offline!
+### Test 2: Follower Recovery & Snapshot Streaming
+1. Kill a Follower node.
+2. Issue 20+ `PUT` commands to the Leader to trigger log compaction.
+3. Restart the killed Follower.
+4. The Follower restores its term and peers from `state.json`, detects it is behind, and receives an `InstallSnapshot` from the Leader to restore the full dataset.
