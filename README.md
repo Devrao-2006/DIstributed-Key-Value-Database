@@ -35,14 +35,14 @@ graph TD
     Client["Client CLI (client/)"] -- gRPC --> Server["Server Transport (server/)"]
     Server -- Proposes Write --> Raft["Raft Consensus (raft/)"]
     
-    subgraph Raft Consensus Cluster
+    subgraph RaftCluster["Raft Consensus Cluster"]
         Raft -- "1. Parallel Log Replication" --> OtherNodes["Follower Nodes"]
         OtherNodes -- "2. Quorum ACK" --> Raft
     end
     
     Raft -- "3. Async Commit" --> Engine["LSM Storage Engine (engine/)"]
     
-    subgraph LSM Storage Engine (engine/)
+    subgraph LSMEngine["LSM Storage Engine (engine/)"]
         Engine -- "A. Appends to" --> WAL["Write-Ahead Log (engine/wal/)"]
         Engine -- "B. Inserts into" --> MemTable["MemTable / AVL Tree (engine/memtable/)"]
         MemTable -- "C. Flushes to disk" --> SSTable["SSTables (engine/sstable/)"]
